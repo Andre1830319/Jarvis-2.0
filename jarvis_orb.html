@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>J.A.R.V.I.S.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-0: #05070b;
+    --bg-1: #0a0f18;
+    --panel: rgba(18, 26, 38, 0.55);
+    --panel-border: rgba(94, 190, 255, 0.18);
+    --cyan: #5ad8ff;
+    --cyan-soft: rgba(90, 216, 255, 0.35);
+    --amber: #e8a94a;
+    --text: #e7eef5;
+    --text-dim: #8fa3b8;
+    --mono: 'Space Grotesk', monospace;
+  }
+
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg-0: #eef2f6;
+      --bg-1: #e2e8f0;
+      --panel: rgba(255, 255, 255, 0.6);
+      --panel-border: rgba(30, 110, 150, 0.2);
+      --cyan: #147aa8;
+      --cyan-soft: rgba(20, 122, 168, 0.28);
+      --amber: #b5731a;
+      --text: #101820;
+      --text-dim: #4a5a68;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg-0: #05070b;
+    --bg-1: #0a0f18;
+    --panel: rgba(18, 26, 38, 0.55);
+    --panel-border: rgba(94, 190, 255, 0.18);
+    --cyan: #5ad8ff;
+    --cyan-soft: rgba(90, 216, 255, 0.35);
+    --amber: #e8a94a;
+    --text: #e7eef5;
+    --text-dim: #8fa3b8;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg-0);
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 20px;
+    background:
+      radial-gradient(ellipse 900px 600px at 50% 18%, color-mix(in srgb, var(--cyan) 10%, transparent), transparent 60%),
+      linear-gradient(180deg, var(--bg-0), var(--bg-1));
+    font-family: 'Inter', sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .stage {
+    width: 100%;
+    max-width: 560px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+  }
+
+  .heading {
+    text-align: center;
+  }
+
+  .heading .mark {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: clamp(28px, 6vw, 38px);
+    letter-spacing: 0.14em;
+    color: var(--text);
+    margin: 0;
+  }
+
+  .heading .sub {
+    margin: 6px 0 0;
+    font-size: 13px;
+    color: var(--text-dim);
+    letter-spacing: 0.02em;
+  }
+
+  .orb-wrap {
+    position: relative;
+    width: min(78vw, 300px);
+    height: min(78vw, 300px);
+    transition: opacity 0.4s ease;
+  }
+
+  .orb-wrap.offline {
+    opacity: 0.3;
+  }
+
+  canvas#orb {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .status-ring {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding-bottom: 6px;
+    pointer-events: none;
+  }
+
+  .status {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    color: var(--cyan);
+    opacity: 0.85;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .status.offline { color: var(--text-dim); }
+
+  .status .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 8px 1px var(--cyan-soft);
+  }
+
+  .status.offline .dot { background: var(--text-dim); box-shadow: none; }
+  .status.thinking .dot, .status.offline .dot { animation: blink 0.9s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0.15; } }
+
+  .readout {
+    width: 100%;
+    min-height: 92px;
+    padding: 18px 20px;
+    border-radius: 14px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    backdrop-filter: blur(6px);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .readout .heard-line {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+
+  .readout .heard-line[hidden] { display: none; }
+
+  .readout .response-line {
+    margin: 0;
+    font-size: 15.5px;
+    line-height: 1.55;
+    color: var(--text);
+  }
+
+  .readout .response-line.placeholder {
+    color: var(--text-dim);
+  }
+
+  .readout .cursor {
+    display: inline-block;
+    width: 7px;
+    height: 1em;
+    background: var(--cyan);
+    vertical-align: text-bottom;
+    margin-left: 2px;
+    animation: blink 0.9s steps(1) infinite;
+  }
+
+  .footnote {
+    font-size: 11.5px;
+    color: var(--text-dim);
+    text-align: center;
+    max-width: 440px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .status.thinking .dot, .status.offline .dot, .readout .cursor { animation: none; opacity: 0.6; }
+  }
+</style>
+</head>
+<body>
+  <main class="stage">
+    <div class="heading">
+      <p class="mark">J.A.R.V.I.S.</p>
+      <p class="sub">Just A Rather Very Intelligent System</p>
+    </div>
+
+    <div class="orb-wrap" id="orbWrap">
+      <canvas id="orb" width="600" height="600" aria-hidden="true"></canvas>
+      <div class="status-ring">
+        <div class="status" id="status">
+          <span class="dot"></span>
+          <span id="statusLabel">CONECTANDO</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="readout" id="readout" aria-live="polite">
+      <p class="heard-line" id="heardLine" hidden></p>
+      <p class="response-line placeholder" id="responseLine">Conectando ao Jarvis...</p>
+    </div>
+
+    <p class="footnote" id="footnote">Esta tela acompanha o jarvis.py rodando no seu computador. Diga "jarvis" perto do microfone para começar.</p>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Orb: a wireframe sphere of latitude/longitude points, hand-rolled 3D.
+  // ---------------------------------------------------------------------
+  var canvas = document.getElementById("orb");
+  var ctx = canvas.getContext("2d");
+  var DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+  function resizeCanvas() {
+    var size = canvas.clientWidth;
+    canvas.width = size * DPR;
+    canvas.height = size * DPR;
+  }
+  window.addEventListener("resize", resizeCanvas);
+  resizeCanvas();
+
+  var LAT_BANDS = 11;
+  var LON_STEPS = 22;
+  var rings = [];
+  for (var i = 0; i <= LAT_BANDS; i++) {
+    var theta = Math.PI * i / LAT_BANDS;
+    var ring = [];
+    for (var j = 0; j < LON_STEPS; j++) {
+      ring.push({ theta: theta, phi: (2 * Math.PI * j) / LON_STEPS });
+    }
+    rings.push(ring);
+  }
+
+  var STATE = { mode: "idle", energy: 0.22, targetEnergy: 0.22, hue: 0, targetHue: 0, jitter: 0, targetJitter: 0 };
+  var rotationY = 0;
+  var lastT = performance.now();
+  var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function setMode(mode) {
+    STATE.mode = mode;
+    if (mode === "idle") { STATE.targetEnergy = 0.24; STATE.targetHue = 0; STATE.targetJitter = 0.4; }
+    if (mode === "thinking") { STATE.targetEnergy = 0.55; STATE.targetHue = 1; STATE.targetJitter = 2.2; }
+    if (mode === "speaking") { STATE.targetEnergy = 0.85; STATE.targetHue = 0; STATE.targetJitter = 1.1; }
+  }
+
+  function colorFor(hueMix, alpha) {
+    // hueMix 0 = cyan, 1 = amber
+    var c1 = [90, 216, 255], c2 = [232, 169, 74];
+    var r = c1[0] + (c2[0] - c1[0]) * hueMix;
+    var g = c1[1] + (c2[1] - c1[1]) * hueMix;
+    var b = c1[2] + (c2[2] - c1[2]) * hueMix;
+    return "rgba(" + r.toFixed(0) + "," + g.toFixed(0) + "," + b.toFixed(0) + "," + alpha.toFixed(3) + ")";
+  }
+
+  function drawOrb(now) {
+    var dt = Math.min((now - lastT) / 1000, 0.05);
+    lastT = now;
+
+    STATE.energy += (STATE.targetEnergy - STATE.energy) * Math.min(dt * 4, 1);
+    STATE.hue += (STATE.targetHue - STATE.hue) * Math.min(dt * 3, 1);
+    STATE.jitter += (STATE.targetJitter - STATE.jitter) * Math.min(dt * 3, 1);
+
+    var speed = reducedMotion ? 0.06 : (0.18 + STATE.energy * 0.5);
+    rotationY += dt * speed;
+
+    var size = canvas.width;
+    ctx.clearRect(0, 0, size, size);
+
+    var cx = size / 2, cy = size / 2;
+    var R = size * 0.30;
+    var tiltX = -0.55;
+    var focal = size * 0.95;
+    var pulse = 1 + Math.sin(now / 480) * 0.02 * (1 + STATE.energy);
+
+    var projected = [];
+    for (var i = 0; i < rings.length; i++) {
+      var row = [];
+      for (var j = 0; j < rings[i].length; j++) {
+        var p = rings[i][j];
+        var wob = reducedMotion ? 0 : Math.sin(now / 260 + i * 0.7 + j * 0.5) * STATE.jitter;
+        var rr = (R + wob) * pulse;
+        var phi = p.phi + rotationY;
+        var x = rr * Math.sin(p.theta) * Math.cos(phi);
+        var y = rr * Math.cos(p.theta);
+        var z = rr * Math.sin(p.theta) * Math.sin(phi);
+
+        var y2 = y * Math.cos(tiltX) - z * Math.sin(tiltX);
+        var z2 = y * Math.sin(tiltX) + z * Math.cos(tiltX);
+
+        var scale = focal / (focal + z2 + R);
+        row.push({
+          x: cx + x * scale,
+          y: cy + y2 * scale,
+          scale: scale,
+          z: z2
+        });
+      }
+      projected.push(row);
+    }
+
+    // connective lines
+    for (var i2 = 0; i2 < projected.length; i2++) {
+      var row2 = projected[i2];
+      for (var j2 = 0; j2 < row2.length; j2++) {
+        var a = row2[j2];
+        var bLon = row2[(j2 + 1) % row2.length];
+        var depthAlpha = Math.max(0, (a.scale - 0.55)) * 1.4;
+        var alphaLine = 0.05 + depthAlpha * 0.16 * (0.5 + STATE.energy);
+        ctx.strokeStyle = colorFor(STATE.hue, alphaLine);
+        ctx.lineWidth = Math.max(0.6, a.scale * 1.1);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(bLon.x, bLon.y);
+        ctx.stroke();
+
+        if (i2 < projected.length - 1) {
+          var bLat = projected[i2 + 1][j2];
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(bLat.x, bLat.y);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // points
+    for (var i3 = 0; i3 < projected.length; i3++) {
+      for (var j3 = 0; j3 < projected[i3].length; j3++) {
+        var pt = projected[i3][j3];
+        if (pt.z < -R * 0.55) continue; // cull far-back points for a cleaner silhouette
+        var alphaPt = 0.35 + Math.max(0, pt.scale - 0.5) * 1.1;
+        var rad = Math.max(0.8, pt.scale * (size * 0.006)) * (1 + STATE.energy * 0.6);
+        ctx.beginPath();
+        ctx.fillStyle = colorFor(STATE.hue, Math.min(1, alphaPt));
+        ctx.shadowColor = colorFor(STATE.hue, 0.9);
+        ctx.shadowBlur = size * 0.012 * (1 + STATE.energy);
+        ctx.arc(pt.x, pt.y, rad, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.shadowBlur = 0;
+
+    // core glow
+    var coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.9);
+    coreGrad.addColorStop(0, colorFor(STATE.hue, 0.20 + STATE.energy * 0.22));
+    coreGrad.addColorStop(1, colorFor(STATE.hue, 0));
+    ctx.fillStyle = coreGrad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.95, 0, Math.PI * 2);
+    ctx.fill();
+
+    requestAnimationFrame(drawOrb);
+  }
+  requestAnimationFrame(drawOrb);
+
+  // ---------------------------------------------------------------------
+  // Live link to jarvis.py over a local WebSocket. This page is a passive
+  // display: it never sends anything, it just renders what the Python
+  // process broadcasts (state/heard/response events).
+  // ---------------------------------------------------------------------
+  var orbWrap = document.getElementById("orbWrap");
+  var statusEl = document.getElementById("status");
+  var statusLabel = document.getElementById("statusLabel");
+  var heardLine = document.getElementById("heardLine");
+  var responseLine = document.getElementById("responseLine");
+
+  var LABELS = { idle: "EM ESPERA", thinking: "PROCESSANDO", speaking: "RESPONDENDO" };
+
+  function setStatus(mode) {
+    setMode(mode);
+    statusLabel.textContent = LABELS[mode] || mode.toUpperCase();
+    statusEl.classList.remove("thinking", "offline");
+    if (mode === "thinking") statusEl.classList.add("thinking");
+  }
+
+  function setConnected(connected) {
+    orbWrap.classList.toggle("offline", !connected);
+    if (!connected) {
+      statusEl.classList.add("offline");
+      statusEl.classList.remove("thinking");
+      statusLabel.textContent = "DESCONECTADO";
+      responseLine.textContent = "Aguardando o jarvis.py iniciar...";
+      responseLine.classList.add("placeholder");
+      heardLine.hidden = true;
+    }
+  }
+
+  function handleServerMessage(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "state" && typeof msg.mode === "string") {
+      setStatus(msg.mode);
+      return;
+    }
+    if (msg.type === "heard" && typeof msg.text === "string") {
+      heardLine.textContent = "Você: " + msg.text;
+      heardLine.hidden = false;
+      return;
+    }
+    if (msg.type === "response" && typeof msg.text === "string") {
+      responseLine.textContent = msg.text;
+      responseLine.classList.remove("placeholder");
+      return;
+    }
+  }
+
+  var WS_PORT = new URLSearchParams(location.search).get("port") || "8765";
+  var reconnectTimer = null;
+  var ws = null;
+
+  function connect() {
+    try {
+      ws = new WebSocket("ws://127.0.0.1:" + WS_PORT);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = function () {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      setConnected(true);
+      responseLine.textContent = 'Conectado. Diga "jarvis" para começar.';
+      responseLine.classList.add("placeholder");
+    };
+    ws.onmessage = function (ev) {
+      try { handleServerMessage(JSON.parse(ev.data)); } catch (e) { /* ignore malformed frames */ }
+    };
+    ws.onclose = function () { setConnected(false); scheduleReconnect(); };
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, 2000);
+  }
+
+  setConnected(false);
+  connect();
+})();
+</script>
+</body>
+</html>

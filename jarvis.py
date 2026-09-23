@@ -29,18 +29,25 @@ Tuning (constants below):
     opening on the wrong monitor and you accept a separate profile for automation.
   OPEN_BROWSER_FULLSCREEN — Fullscreen on the chosen monitor (Windows: new window is detected and snapped with SetWindowPos).
     Default False.
-  JARVIS_WELCOME_* — TTS after the song (ElevenLabs). Configure via environment or a `.env`
-    file next to this script (ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, etc.).
-    With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
-    replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
-    or set JARVIS_WELCOME_CACHE_ENABLED=False to force a fresh fetch.
+  JARVIS_WELCOME_* — TTS after the song. Configure via environment or a `.env`
+    file next to this script. Default engine is edge-tts (Microsoft Edge's free
+    online voice service, no API key needed); set JARVIS_TTS_ENGINE=elevenlabs
+    to use ElevenLabs instead (ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, etc.),
+    or leave the default and Jarvis still falls back to ElevenLabs automatically
+    if edge-tts fails and an ElevenLabs key/voice are configured (and vice versa).
+    With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/`
+    and replayed when phrase + engine + voice match—no repeat network call. Delete
+    that folder or set JARVIS_WELCOME_CACHE_ENABLED=False to force a fresh fetch.
   The welcome sequence runs only once per process. The assistant speaks in the background so Cursor
     opens without waiting for playback to finish (restart the script to run again).
 """
 
 from __future__ import annotations
 
+import asyncio
+import email
 import hashlib
+import imaplib
 import json
 import logging
 import os
@@ -54,12 +61,24 @@ import time
 import wave
 import webbrowser
 from datetime import datetime
+from email.header import decode_header
+from email.utils import parseaddr
 from pathlib import Path
 
 from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
 import speech_recognition as sr
+
+try:
+    import websockets
+except ImportError:
+    websockets = None  # HUD server disables itself gracefully if missing
+
+# Load .env FIRST, before any constant below reads os.environ — otherwise
+# overrides (JARVIS_WAKE_MIN_RMS, GROQ_MODEL, JARVIS_INPUT_DEVICE, etc.) would
+# silently fall back to their hardcoded defaults every time.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # --- tuning knobs -----------------------------------------------------------
 SAMPLE_RATE = 44100
@@ -72,8 +91,8 @@ WAKE_WORD = "jarvis"
 # Language passed to the speech recognizer (pt-BR, en-US, ...).
 WAKE_LANGUAGE = "pt-BR"
 
-WAKE_MIN_RMS = 0.015
-WAKE_SILENCE_HANG_S = 0.6
+WAKE_MIN_RMS = float((os.environ.get("JARVIS_WAKE_MIN_RMS") or "0.015").strip() or 0.015)
+WAKE_SILENCE_HANG_S = float((os.environ.get("JARVIS_WAKE_SILENCE_HANG_S") or "1.1").strip() or 1.1)
 WAKE_MIN_UTTERANCE_S = 0.3
 WAKE_MAX_UTTERANCE_S = 15.0
 WAKE_COOLDOWN_S = 2.0
@@ -111,8 +130,20 @@ JARVIS_WELCOME_PHRASE = (
 )
 # Seconds after launching SONG_URI before speaking (gives YouTube/browser time to start).
 JARVIS_AFTER_SONG_DELAY_S = 1.0
-# Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
+# Save TTS audio under .cache/jarvis_welcome/; replay skips the network call when
+# phrase + engine + voice match.
 JARVIS_WELCOME_CACHE_ENABLED = True
+
+# Which TTS engine to try first: "edge" (Microsoft Edge's free online voice
+# service — no API key, no quota) or "elevenlabs" (paid/credit-based, higher
+# voice quality and cloning). Whichever is NOT chosen here is still tried as an
+# automatic fallback if the first one fails (missing key, quota exceeded, no
+# internet, etc.) — see _speak() — so a problem in one engine doesn't leave
+# Jarvis mute, it just uses the other.
+JARVIS_TTS_ENGINE = (os.environ.get("JARVIS_TTS_ENGINE") or "edge").strip().lower()
+# Voice for edge-tts. Full list: run `edge-tts --list-voices` in a terminal.
+# Other pt-BR options include pt-BR-FranciscaNeural (female).
+EDGE_TTS_VOICE = (os.environ.get("EDGE_TTS_VOICE") or "pt-BR-AntonioNeural").strip()
 
 # Real Q&A: say "jarvis" followed by a question/request in the same utterance
 # (e.g. "jarvis, que dia é hoje?") and it's sent to Groq's free API; the answer
@@ -148,6 +179,8 @@ APP_ALIASES: dict[str, str] = {
     "paint": "mspaint.exe",
     "chrome": "chrome.exe",
     "google chrome": "chrome.exe",
+    "opera": "opera.exe",
+    "opera gx": "opera.exe",
     "spotify": "Spotify.exe",
     "word": "WINWORD.EXE",
     "microsoft word": "WINWORD.EXE",
@@ -164,14 +197,137 @@ APP_ALIASES: dict[str, str] = {
     "telegram": "Telegram.exe",
 }
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Voice-read emails ("jarvis, tem email novo?" / "jarvis, lê meus emails").
+# Reads the INBOX via IMAP (Gmail by default) and skips anything that looks
+# like spam/newsletter/marketing mail — true spam is already filtered by
+# Gmail into its Spam folder (never read here since we only open INBOX); on
+# top of that, messages carrying a List-Unsubscribe header, or
+# Precedence: bulk/list/junk, are treated as bulk mail and skipped too.
+# Requires EMAIL_ADDRESS + EMAIL_APP_PASSWORD in .env (see README).
+JARVIS_EMAIL_ENABLED = True
+EMAIL_MAX_RESULTS = 15
+EMAIL_BODY_PREVIEW_CHARS = 220
 
+# Opens the visual orb (jarvis_orb.html, in the same folder as this script)
+# in the default browser as soon as the script starts — a HUD-style
+# companion that replaces the terminal window. It connects back to this
+# process over a local WebSocket (see JARVIS_HUD_* below) and shows live
+# status (idle/thinking/speaking), what was heard, and what Jarvis says.
+OPEN_ORB_VISUAL_ON_START = True
+ORB_VISUAL_HTML_PATH = Path(__file__).resolve().parent / "jarvis_orb.html"
+
+# Local-only WebSocket link to jarvis_orb.html, so the HUD can show live
+# status/transcript/answers instead of (or alongside) the terminal. No
+# external network exposure — binds to 127.0.0.1 only.
+JARVIS_HUD_ENABLED = True
+JARVIS_HUD_PORT = int((os.environ.get("JARVIS_HUD_PORT") or "8765").strip() or 8765)
+
+# Where logs go. With pythonw.exe (no console attached, used for silent
+# startup-on-login), there is nothing to print to — logs go to this file
+# instead. LOG_FILE_PATH is always written to; the console handler is only
+# added when a real console is attached (python.exe).
+LOG_FILE_PATH = Path(__file__).resolve().parent / "jarvis.log"
+
+_log_handlers: list[logging.Handler] = [
+    logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+]
+try:
+    # Under pythonw.exe (no console), sys.stdout is sometimes None and
+    # sometimes a dummy object that raises on write, depending on the Python
+    # build — a bare "is not None" check misses the second case, so verify
+    # with an actual write before trusting it as a real console.
+    if sys.stdout is not None:
+        sys.stdout.write("")
+        sys.stdout.flush()
+        _log_handlers.append(logging.StreamHandler(sys.stdout))
+except Exception:
+    pass
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=_log_handlers,
 )
 log = logging.getLogger("jarvis")
+
+
+# --- HUD (jarvis_orb.html) live link ----------------------------------------
+_hud_loop: asyncio.AbstractEventLoop | None = None
+_hud_clients: set = set()
+_hud_ready = threading.Event()
+
+
+def _hud_start_server() -> None:
+    """Runs in its own background thread for the whole process lifetime: owns
+    an asyncio event loop and a tiny local WebSocket server that
+    jarvis_orb.html connects to. Never touches the internet — 127.0.0.1 only."""
+    global _hud_loop
+    if websockets is None:
+        log.warning(
+            "The 'websockets' package is missing; the HUD (jarvis_orb.html) "
+            "will show 'not connected'. Run: pip install -r requirements.txt"
+        )
+        return
+
+    async def _handler(websocket):
+        _hud_clients.add(websocket)
+        try:
+            await websocket.send(json.dumps({"type": "state", "mode": "idle"}))
+            async for _ in websocket:
+                pass  # the page is a passive display; it never sends anything back
+        except Exception:
+            pass
+        finally:
+            _hud_clients.discard(websocket)
+
+    async def _serve_forever() -> None:
+        try:
+            async with websockets.serve(_handler, "127.0.0.1", JARVIS_HUD_PORT):
+                _hud_ready.set()
+                await asyncio.Future()  # run until the process exits
+        except OSError as e:
+            log.warning("HUD server could not bind to port %d: %s", JARVIS_HUD_PORT, e)
+
+    loop = asyncio.new_event_loop()
+    _hud_loop = loop
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_serve_forever())
+
+
+def hud_broadcast(payload: dict) -> None:
+    """Thread-safe: send one JSON event to every connected jarvis_orb.html
+    tab. A no-op (never raises) if the HUD is disabled, not started yet, or
+    no page is currently connected — callers don't need to check first."""
+    if not JARVIS_HUD_ENABLED or _hud_loop is None or not _hud_clients:
+        return
+    data = json.dumps(payload)
+
+    async def _send_all() -> None:
+        stale = []
+        for ws in list(_hud_clients):
+            try:
+                await ws.send(data)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            _hud_clients.discard(ws)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send_all(), _hud_loop)
+    except RuntimeError:
+        pass  # loop already shutting down
+
+
+def hud_state(mode: str) -> None:
+    hud_broadcast({"type": "state", "mode": mode})
+
+
+def hud_heard(text: str) -> None:
+    hud_broadcast({"type": "heard", "text": text})
+
+
+def hud_response(text: str) -> None:
+    hud_broadcast({"type": "response", "text": text})
 
 
 def block_samples() -> int:
@@ -335,12 +491,21 @@ def _jarvis_welcome_cache_dir() -> Path:
     return base / ".cache" / "jarvis_welcome"
 
 
+def _speech_cache_path(text: str, cache_key: str, ext: str) -> Path:
+    """Generic cache path for any TTS engine: same text + same engine/voice/
+    settings (cache_key) always hashes to the same file, so a repeated phrase
+    (e.g. the welcome line) replays instantly instead of hitting the network."""
+    key = f"{text}|{cache_key}".encode()
+    digest = hashlib.sha256(key).hexdigest()[:24]
+    return _jarvis_welcome_cache_dir() / f"{digest}.{ext}"
+
+
 def _jarvis_welcome_cache_path(
     text: str, voice_id: str, model_id: str, output_format: str
 ) -> Path:
-    key = f"{text}|{voice_id}|{model_id}|{output_format}".encode()
-    digest = hashlib.sha256(key).hexdigest()[:24]
-    return _jarvis_welcome_cache_dir() / f"{digest}.wav"
+    return _speech_cache_path(
+        text, f"elevenlabs|{voice_id}|{model_id}|{output_format}", "wav"
+    )
 
 
 def _play_pcm_wav_file(path: Path) -> bool:
@@ -369,6 +534,25 @@ def _play_pcm_wav_file(path: Path) -> bool:
     return True
 
 
+def _play_audio_file(path: Path) -> bool:
+    """Play a compressed audio file (mp3, as returned by edge-tts) via the
+    'playsound' package, which on Windows uses the built-in MCI/winmm codec —
+    no ffmpeg or extra decoding dependency needed."""
+    try:
+        from playsound import playsound
+    except ImportError:
+        log.warning(
+            "Install dependencies: pip install -r requirements.txt (missing 'playsound')."
+        )
+        return False
+    try:
+        playsound(str(path))
+    except Exception as e:
+        log.warning("Could not play audio file %s: %s", path, e)
+        return False
+    return True
+
+
 def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -385,16 +569,87 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
         raise
 
 
-def _elevenlabs_speak(text: str) -> None:
-    """Fetch (or replay from cache) ElevenLabs TTS for arbitrary text and play it.
+def _speak(text: str) -> None:
+    """Fetch TTS audio and play it — tries JARVIS_TTS_ENGINE first, then
+    automatically falls back to the other engine if the first one fails or
+    isn't configured (missing key, quota exceeded, no internet, edge-tts not
+    installed, ...), so a problem in one engine doesn't leave Jarvis mute.
     Shared by the fixed welcome phrase and by spoken assistant answers."""
     text = text.strip()
     if not text:
         return
+    hud_response(text)
+    hud_state("speaking")
+    try:
+        engines = [_edge_tts_speak_impl, _elevenlabs_speak_impl]
+        if JARVIS_TTS_ENGINE == "elevenlabs":
+            engines.reverse()
+        for engine in engines:
+            if engine(text):
+                return
+        log.warning(
+            "No TTS engine could speak the text (see the warnings above for why)."
+        )
+    finally:
+        hud_state("idle")
+
+
+def _edge_tts_speak_impl(text: str) -> bool:
+    """Free TTS via Microsoft Edge's online voice service — no API key, no
+    quota. Requires internet (it talks to Microsoft's service) but not an
+    installed copy of Edge itself."""
+    try:
+        import edge_tts
+    except ImportError:
+        log.warning(
+            "Install dependencies: pip install -r requirements.txt (missing 'edge-tts')."
+        )
+        return False
+
+    voice = EDGE_TTS_VOICE
+    cache_path = _speech_cache_path(text, f"edge|{voice}", "mp3")
+    if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
+        log.info("Playing speech from cache: %s", cache_path)
+        if _play_audio_file(cache_path):
+            return True
+        log.warning("Cache miss after read failure; fetching from edge-tts.")
+
+    if JARVIS_WELCOME_CACHE_ENABLED:
+        out_path = cache_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = (
+            Path(tempfile.gettempdir())
+            / f"jarvis_edge_tts_{os.getpid()}_{int(time.time() * 1000)}.mp3"
+        )
+
+    async def _run() -> None:
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(str(out_path))
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        log.warning("edge-tts request failed: %s", e)
+        return False
+
+    if not out_path.is_file() or out_path.stat().st_size == 0:
+        log.warning("edge-tts returned no audio.")
+        return False
+
+    ok = _play_audio_file(out_path)
+    if ok and JARVIS_WELCOME_CACHE_ENABLED:
+        log.info("Saved speech audio to cache: %s", out_path)
+    if not JARVIS_WELCOME_CACHE_ENABLED:
+        out_path.unlink(missing_ok=True)
+    return ok
+
+
+def _elevenlabs_speak_impl(text: str) -> bool:
     vid, model_id, output_format, pcm_rate = elevenlabs_env_config()
     if not vid:
         log.warning("Set ELEVENLABS_VOICE_ID in the environment for ElevenLabs TTS.")
-        return
+        return False
     if not output_format.startswith("pcm_"):
         # Everything downstream (cache file, sd.play) assumes raw 16-bit PCM.
         # Any other ELEVENLABS_OUTPUT_FORMAT (mp3_*, ulaw_8000, ...) would be
@@ -404,24 +659,24 @@ def _elevenlabs_speak(text: str) -> None:
             "knows how to play raw PCM. Set it to e.g. pcm_24000.",
             output_format,
         )
-        return
+        return False
 
     cache_path = _jarvis_welcome_cache_path(text, vid, model_id, output_format)
     if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
         log.info("Playing speech from cache: %s", cache_path)
         if _play_pcm_wav_file(cache_path):
-            return
+            return True
         log.warning("Cache miss after read failure; fetching from ElevenLabs.")
 
     api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not api_key:
         log.warning("Set ELEVENLABS_API_KEY in the environment for ElevenLabs TTS.")
-        return
+        return False
     try:
         from elevenlabs.client import ElevenLabs
     except ImportError:
         log.warning("Install dependencies: pip install -r requirements.txt")
-        return
+        return False
     try:
         client = ElevenLabs(api_key=api_key)
         chunks = client.text_to_speech.convert(
@@ -433,10 +688,10 @@ def _elevenlabs_speak(text: str) -> None:
         raw = b"".join(chunks)
     except Exception as e:
         log.warning("ElevenLabs TTS failed: %s", e)
-        return
+        return False
     if not raw:
         log.warning("ElevenLabs returned empty audio.")
-        return
+        return False
     if len(raw) % 2:
         # 16-bit PCM must come in 2-byte samples; an odd length means a
         # truncated/corrupted response. Drop the stray trailing byte.
@@ -446,14 +701,14 @@ def _elevenlabs_speak(text: str) -> None:
         )
         raw = raw[:-1]
         if not raw:
-            return
+            return False
     try:
         pcm_i16 = np.frombuffer(raw, dtype=np.int16)
         pcm_f = pcm_i16.astype(np.float32) / 32768.0
     except ValueError as e:
         # Decode failure (e.g. response wasn't actually PCM) — don't cache garbage.
         log.warning("Could not decode ElevenLabs audio as PCM: %s", e)
-        return
+        return False
     if JARVIS_WELCOME_CACHE_ENABLED:
         try:
             _save_pcm_wav_file(cache_path, raw, pcm_rate)
@@ -465,12 +720,14 @@ def _elevenlabs_speak(text: str) -> None:
         sd.wait()
     except Exception as e:
         log.warning("Could not play ElevenLabs audio: %s", e)
+        return False
+    return True
 
 
 def say_jarvis_welcome() -> None:
     if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
         return
-    _elevenlabs_speak(JARVIS_WELCOME_PHRASE.strip())
+    _speak(JARVIS_WELCOME_PHRASE.strip())
 
 
 _PT_WEEKDAYS = (
@@ -546,6 +803,20 @@ def open_app(name: str) -> str:
                 log.warning("Could not launch %r at %s: %s", name, full_path, e)
                 return f"Não consegui abrir {name}."
 
+    if exe.lower() == "opera.exe":
+        # Same problem as Discord/WhatsApp: Opera GX installs per-user and
+        # doesn't register under Windows' App Paths, so reuse the finder
+        # already used to launch the song/Claude in it.
+        opera_path = _opera_gx_executable()
+        if opera_path:
+            try:
+                subprocess.Popen([opera_path])
+                log.info("Opened app %r via %s", name, opera_path)
+                return f"Abri {name}."
+            except OSError as e:
+                log.warning("Could not launch %r at %s: %s", name, opera_path, e)
+                return f"Não consegui abrir {name}."
+
     try:
         os.startfile(exe)  # resolves via PATH / Windows App Paths registry
         log.info("Opened app %r (%s)", name, exe)
@@ -602,6 +873,125 @@ def close_app(name: str) -> str:
         return f"Não consegui fechar {name}."
 
 
+def _decode_mime_header(value: str | None) -> str:
+    if not value:
+        return ""
+    decoded = ""
+    for text, enc in decode_header(value):
+        if isinstance(text, bytes):
+            try:
+                decoded += text.decode(enc or "utf-8", errors="replace")
+            except (LookupError, TypeError):
+                decoded += text.decode("utf-8", errors="replace")
+        else:
+            decoded += text
+    return decoded.strip()
+
+
+def _email_looks_like_bulk(msg: email.message.Message) -> bool:
+    """Heuristic: skip newsletters/marketing even if Gmail didn't flag them as
+    spam. A List-Unsubscribe header is one of the most reliable signals bulk
+    senders use; Precedence/Auto-Submitted catch most of the rest."""
+    if msg.get("List-Unsubscribe"):
+        return True
+    if (msg.get("Precedence") or "").strip().lower() in ("bulk", "list", "junk"):
+        return True
+    auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return True
+    return False
+
+
+def _email_body_preview(msg: email.message.Message) -> str:
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.get_content_type() != "text/plain" or part.get_filename():
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+            return " ".join(text.split())[:EMAIL_BODY_PREVIEW_CHARS]
+        except (LookupError, TypeError, ValueError):
+            continue
+    return ""
+
+
+def read_emails(count: int = 5, unread_only: bool = True) -> str:
+    """Reads the most recent inbox emails via IMAP, skipping anything that
+    looks like spam/bulk/marketing mail. Returns a short text summary for the
+    assistant to read out loud (never raises — errors come back as a message
+    the assistant can relay)."""
+    address = (os.environ.get("EMAIL_ADDRESS") or "").strip()
+    app_password = (os.environ.get("EMAIL_APP_PASSWORD") or "").strip()
+    if not address or not app_password:
+        return (
+            "Não consegui acessar os emails: EMAIL_ADDRESS e EMAIL_APP_PASSWORD "
+            "não estão configurados no .env."
+        )
+    host = (os.environ.get("EMAIL_IMAP_HOST") or "imap.gmail.com").strip()
+    try:
+        port = int((os.environ.get("EMAIL_IMAP_PORT") or "993").strip() or 993)
+    except ValueError:
+        port = 993
+    try:
+        count = max(1, min(int(count), EMAIL_MAX_RESULTS))
+    except (TypeError, ValueError):
+        count = 5
+
+    try:
+        conn = imaplib.IMAP4_SSL(host, port)
+    except OSError as e:
+        log.warning("IMAP connection to %s:%d failed: %s", host, port, e)
+        return "Não consegui conectar ao servidor de email."
+
+    try:
+        try:
+            conn.login(address, app_password)
+        except imaplib.IMAP4.error as e:
+            log.warning("IMAP login failed for %s: %s", address, e)
+            return "Não consegui entrar na caixa de email — confira EMAIL_ADDRESS e EMAIL_APP_PASSWORD."
+
+        conn.select("INBOX", readonly=True)
+        criterion = "UNSEEN" if unread_only else "ALL"
+        status, data = conn.search(None, criterion)
+        if status != "OK":
+            return "Não consegui listar os emails da caixa de entrada."
+        ids = data[0].split()
+        if not ids:
+            return "Não há emails novos." if unread_only else "A caixa de entrada está vazia."
+
+        # Newest first; fetch a few extra candidates since some get filtered as bulk.
+        candidate_ids = list(reversed(ids))[: count * 3]
+        summaries: list[str] = []
+        for msg_id in candidate_ids:
+            if len(summaries) >= count:
+                break
+            status, msg_data = conn.fetch(msg_id, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            if _email_looks_like_bulk(msg):
+                continue
+            sender_name, sender_addr = parseaddr(_decode_mime_header(msg.get("From")))
+            sender = sender_name or sender_addr or "remetente desconhecido"
+            subject = _decode_mime_header(msg.get("Subject")) or "(sem assunto)"
+            preview = _email_body_preview(msg)
+            line = f'De {sender}: "{subject}"'
+            if preview:
+                line += f" — {preview}"
+            summaries.append(line)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    if not summaries:
+        return "Só encontrei emails que pareciam spam ou newsletter; nada relevante pra ler."
+    return "; ".join(summaries)
+
+
 JARVIS_TOOLS = [
     {
         "type": "function",
@@ -637,8 +1027,40 @@ JARVIS_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_emails",
+            "description": (
+                "Lê os emails mais recentes da caixa de entrada do usuário. Ignora "
+                "automaticamente spam, newsletters e emails de marketing/bulk. Use "
+                "quando o usuário pedir para ver, checar, ler ou resumir os emails."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "Quantos emails retornar (padrão 5, máximo 15).",
+                    },
+                    "unread_only": {
+                        "type": "boolean",
+                        "description": (
+                            "True (padrão) retorna só emails não lidos. False retorna "
+                            "os mais recentes independente de já terem sido lidos."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
-JARVIS_TOOL_IMPL = {"open_app": open_app, "close_app": close_app}
+JARVIS_TOOL_IMPL = {
+    "open_app": open_app,
+    "close_app": close_app,
+    "read_emails": read_emails,
+}
 
 
 def _run_tool_call(name: str, arguments_json: str) -> str:
@@ -685,6 +1107,15 @@ def _remember_turn(question: str, answer: str) -> None:
             del _assistant_history[: len(_assistant_history) - max_msgs]
 
 
+def _active_tools() -> list[dict]:
+    names_enabled = set()
+    if JARVIS_APP_CONTROL_ENABLED:
+        names_enabled.update({"open_app", "close_app"})
+    if JARVIS_EMAIL_ENABLED:
+        names_enabled.add("read_emails")
+    return [t for t in JARVIS_TOOLS if t["function"]["name"] in names_enabled]
+
+
 def ask_assistant(question: str) -> str | None:
     """Send `question` (plus recent conversation history) to Groq's free API
     and return a short spoken-friendly answer, or None if the assistant is
@@ -710,8 +1141,9 @@ def ask_assistant(question: str) -> str | None:
         # eat the whole max_tokens for a short spoken reply. "low" keeps
         # latency down for a voice assistant.
         kwargs["reasoning_effort"] = "low"
-    if JARVIS_APP_CONTROL_ENABLED:
-        kwargs["tools"] = JARVIS_TOOLS
+    active_tools = _active_tools()
+    if active_tools:
+        kwargs["tools"] = active_tools
         kwargs["tool_choice"] = "auto"
     try:
         client = Groq(api_key=api_key)
@@ -775,9 +1207,21 @@ def _handle_jarvis_question(question: str) -> None:
     answer = ask_assistant(question)
     if not answer:
         log.warning("No answer from assistant for: %r", question)
+        # Previously this just logged a warning and silently went back to
+        # idle — from the HUD/voice side it looked exactly like nothing had
+        # happened at all (no "Você: ..." update beyond what was already
+        # shown, no spoken reply), which is indistinguishable from a wake
+        # word or speech-recognition failure. Surface it instead, so a
+        # broken/misconfigured assistant (bad GROQ_API_KEY, wrong/decommissioned
+        # GROQ_MODEL, network issue, etc.) is obvious instead of looking like
+        # Jarvis just isn't responding. See jarvis.log for the actual error.
+        _speak(
+            "Desculpe, não consegui falar com o assistente agora. "
+            "Confira o jarvis.log para mais detalhes."
+        )
         return
     log.info("Assistant answered: %r", answer)
-    _elevenlabs_speak(answer)
+    _speak(answer)
     _arm_followup_window()
 
 
@@ -1301,7 +1745,7 @@ def _normalize_for_match(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
 
 
-_WAKE_WORD_RE = re.compile(re.escape(WAKE_WORD), re.IGNORECASE)
+_WAKE_WORD_NORM_RE = re.compile(re.escape(_normalize_for_match(WAKE_WORD)))
 
 # Shared across recognition threads: monotonic deadline until which the next
 # utterance (even with no wake word in it) is treated as a follow-up question.
@@ -1311,9 +1755,18 @@ _listen_for_question_lock = threading.Lock()
 
 def _extract_query_after_wake_word(text: str) -> str:
     """Whatever follows WAKE_WORD in the same utterance, e.g. 'jarvis, que dia
-    é hoje?' -> 'que dia é hoje?'. Empty string if it's just the wake word
-    (unaccented match only; accented mishears fall back to no query)."""
-    m = _WAKE_WORD_RE.search(text)
+    é hoje?' -> 'que dia é hoje?'. Empty string if it's just the wake word.
+
+    Matches against the accent-stripped text (same normalization as
+    has_wake_word in _process_wake_utterance), so an accented mishear like
+    'Járvis, que dia é hoje?' still has its question extracted correctly
+    instead of silently falling back to the bare-wake-word (welcome-only)
+    path. NFKD decomposition + combining-mark removal preserves character
+    offsets for single-codepoint Latin accents (á, é, ã, ç, ...), so indices
+    found in the normalized string can be used directly on the original
+    text."""
+    normalized = _normalize_for_match(text)
+    m = _WAKE_WORD_NORM_RE.search(normalized)
     if not m:
         return ""
     return text[m.end():].strip(" ,.!?-–—")
@@ -1353,25 +1806,32 @@ def _process_wake_utterance(
         text = recognizer.recognize_google(audio, language=WAKE_LANGUAGE)
     except sr.UnknownValueError:
         log.info("Utterance not understood; ignoring.")
+        hud_state("idle")
         return
     except sr.RequestError as e:
         log.warning("Speech recognition request failed: %s", e)
+        hud_state("idle")
         return
 
     log.info("Heard: %r", text)
+    hud_heard(text)
     has_wake_word = _normalize_for_match(WAKE_WORD) in _normalize_for_match(text)
 
     if not has_wake_word:
         if _consume_followup_window():
             log.info("Treating as follow-up question (no need to repeat %r): %r", WAKE_WORD, text)
+            hud_state("thinking")
             threading.Thread(
                 target=_handle_jarvis_question, args=(text,), daemon=True
             ).start()
+        else:
+            hud_state("idle")
         return
 
     query = _extract_query_after_wake_word(text)
     if query:
         log.info("Wake word %r detected with question: %r", WAKE_WORD, query)
+        hud_state("thinking")
         threading.Thread(
             target=_handle_jarvis_question, args=(query,), daemon=True
         ).start()
@@ -1383,10 +1843,28 @@ def _process_wake_utterance(
 
     if wake_event.is_set():
         log.info("Wake word %r heard again in %r — welcome already ran, skipping actions.", WAKE_WORD, text)
+        hud_state("idle")
         return
     wake_event.set()
     log.info("Wake word %r detected in %r — running welcome once.", WAKE_WORD, text)
+    hud_state("thinking")
     run_wake_word_actions()
+
+
+def open_orb_visual() -> None:
+    """Opens jarvis_orb.html in the default browser, if present next to this
+    script. Best-effort only — never raises, just logs a warning."""
+    if not ORB_VISUAL_HTML_PATH.is_file():
+        log.warning(
+            "OPEN_ORB_VISUAL_ON_START is True but %s was not found; skipping.",
+            ORB_VISUAL_HTML_PATH,
+        )
+        return
+    try:
+        webbrowser.open(ORB_VISUAL_HTML_PATH.resolve().as_uri())
+        log.info("Opened the orb visual: %s", ORB_VISUAL_HTML_PATH)
+    except OSError as e:
+        log.warning("Could not open the orb visual: %s", e)
 
 
 def main() -> int:
@@ -1398,6 +1876,15 @@ def main() -> int:
     utterance_start = 0.0
     last_voice_time = 0.0
     last_recognition_attempt = 0.0
+
+    if JARVIS_HUD_ENABLED:
+        threading.Thread(target=_hud_start_server, daemon=True).start()
+        _hud_ready.wait(timeout=2.0)  # best-effort: let the server bind before the page opens
+        if _hud_ready.is_set():
+            log.info("HUD server listening on ws://127.0.0.1:%d", JARVIS_HUD_PORT)
+
+    if OPEN_ORB_VISUAL_ON_START:
+        open_orb_visual()
 
     log.info(
         "Listening for the wake word %r (language=%s, rate=%d, block=%d ms, "
@@ -1433,9 +1920,12 @@ def main() -> int:
     if JARVIS_WELCOME_ENABLED:
         ev, em, ef, er = elevenlabs_env_config()
         log.info(
-            "After song + %.2fs: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
+            "After song + %.2fs: %r (TTS engine=%s first, edge-tts voice=%s, "
+            "ElevenLabs voice=%s/model=%s/format=%s/pcm_rate=%d as fallback)",
             JARVIS_AFTER_SONG_DELAY_S,
             JARVIS_WELCOME_PHRASE.strip(),
+            JARVIS_TTS_ENGINE,
+            EDGE_TTS_VOICE,
             ev or "(unset)",
             em,
             ef,
@@ -1458,8 +1948,23 @@ def main() -> int:
             )
         elif JARVIS_APP_CONTROL_ENABLED:
             log.info("App open/close is enabled but only implemented for Windows.")
+        if JARVIS_EMAIL_ENABLED:
+            if os.environ.get("EMAIL_ADDRESS") and os.environ.get("EMAIL_APP_PASSWORD"):
+                log.info(
+                    "Also say %r + 'lê meus emails' to hear recent inbox mail "
+                    "(spam/newsletters skipped automatically).",
+                    WAKE_WORD,
+                )
+            else:
+                log.info(
+                    "Email reading is enabled but EMAIL_ADDRESS/EMAIL_APP_PASSWORD "
+                    "are not set — set them in .env to use it."
+                )
 
     input_idx = _choose_input_device(blocksize)
+
+    last_level_log = 0.0
+    level_log_peak = 0.0
 
     try:
         with sd.InputStream(
@@ -1477,6 +1982,17 @@ def main() -> int:
                 level = rms_mono(data)
                 now = time.monotonic()
                 block = data.reshape(-1).copy()
+
+                level_log_peak = max(level_log_peak, level)
+                if now - last_level_log >= 3.0:
+                    log.info(
+                        "mic level check: peak rms in last 3s = %.5f (WAKE_MIN_RMS = %.5f) — %s",
+                        level_log_peak,
+                        WAKE_MIN_RMS,
+                        "crossed threshold" if level_log_peak >= WAKE_MIN_RMS else "stayed below threshold",
+                    )
+                    level_log_peak = 0.0
+                    last_level_log = now
 
                 if level >= WAKE_MIN_RMS:
                     if not speaking:
@@ -1499,6 +2015,7 @@ def main() -> int:
                             and (now - last_recognition_attempt) >= WAKE_COOLDOWN_S
                         ):
                             last_recognition_attempt = now
+                            hud_state("thinking")
                             threading.Thread(
                                 target=_process_wake_utterance,
                                 args=(frames_snapshot, wake_event),
@@ -1517,4 +2034,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        log.exception("Unhandled error — Jarvis stopped. See jarvis.log.")
+        sys.exit(1)
